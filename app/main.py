@@ -1,12 +1,11 @@
-"""Main entry point — wires all components together and starts the monitoring service.
+"""Main entry point — wires all components and runs bot + monitor concurrently.
 
 Design Decisions:
-    - Dependency injection: each component receives its dependencies explicitly.
-      No hidden globals, no import-time side effects.
-    - Signal handlers for graceful shutdown: SIGTERM/SIGINT trigger the stop event,
-      allowing the current cycle to finish before exit.
-    - Startup sequence: config → logging → database → checker → notifier → monitor.
-      Each step validates the previous one succeeded before continuing.
+    - Telegram bot polling and monitor scheduler run as concurrent asyncio tasks.
+    - The bot provides interactive control (/monitor, /demonitor, etc).
+    - The scheduler runs periodic checks in the background.
+    - Both share the same repository and checker instances.
+    - Signal handlers trigger graceful shutdown of both.
 """
 
 import asyncio
@@ -21,20 +20,18 @@ from app.config.settings import get_settings, Settings
 from app.database.engine import DatabaseManager
 from app.database.repository import UsernameRepository
 from app.monitor.scheduler import MonitorScheduler
-from app.notifier.telegram import TelegramNotifier
+from app.notifier.telegram import TelegramBot
 from app.utils.logging import setup_logging
 
 
 async def run_service() -> None:
     """Initialize all components and run the monitoring service.
 
-    Orchestrates the full startup → run → shutdown lifecycle:
-    1. Load configuration from .env
-    2. Initialize logging
-    3. Connect to database and create tables
-    4. Initialize Instagram checker and Telegram notifier
-    5. Start the monitoring loop
-    6. Handle graceful shutdown on SIGTERM/SIGINT
+    Starts both:
+    1. Telegram bot (polling for commands)
+    2. Monitor scheduler (periodic checks)
+
+    They run concurrently and share the same database + checker.
     """
     # ── Step 1: Configuration ──────────────────────────────
     settings: Settings = get_settings()
@@ -63,41 +60,84 @@ async def run_service() -> None:
     checker = InstagramChecker(
         check_delay=settings.check_delay_seconds,
     )
-    notifier = TelegramNotifier(
+
+    # ── Step 5: Telegram Bot ───────────────────────────────
+    telegram_bot = TelegramBot(
         bot_token=settings.telegram_bot_token,
         chat_id=settings.telegram_chat_id,
     )
+    telegram_bot.setup(repository=repository, checker=checker)
 
-    # ── Step 5: Monitor ────────────────────────────────────
+    # ── Step 6: Monitor Scheduler ──────────────────────────
     monitor = MonitorScheduler(
         repository=repository,
         checker=checker,
-        notifier=notifier,
+        notifier=telegram_bot,
         check_interval=settings.check_interval_seconds,
         max_concurrent=settings.max_concurrent_checks,
     )
 
-    # ── Step 6: Signal handlers for graceful shutdown ──────
+    # ── Step 7: Start both concurrently ────────────────────
+    async def _run_bot() -> None:
+        """Start the Telegram bot polling."""
+        await telegram_bot.start()
+        await telegram_bot.send_startup_notification()
+        logger.info("Telegram bot started and polling for commands")
+        # Keep running until stopped
+        while True:
+            await asyncio.sleep(1)
+
+    async def _run_monitor() -> None:
+        """Start the monitoring scheduler."""
+        # Small delay to let the bot start first
+        await asyncio.sleep(2)
+        await monitor.start()
+
+    # Signal handling for graceful shutdown
+    shutdown_event = asyncio.Event()
+
     def _handle_signal(sig: int, frame: Optional[FrameType] = None) -> None:
-        """Handle shutdown signals (SIGTERM, SIGINT)."""
+        """Handle SIGTERM/SIGINT for graceful shutdown."""
         sig_name = signal.Signals(sig).name
         logger.info("Received {} — shutting down gracefully", sig_name)
-        asyncio.get_event_loop().create_task(monitor.stop())
+        shutdown_event.set()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # ── Run the monitoring loop ────────────────────────────
+    # Run bot, monitor, and shutdown watcher concurrently
+    bot_task = asyncio.create_task(_run_bot())
+    monitor_task = asyncio.create_task(_run_monitor())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+
     try:
-        await monitor.start()
+        # Wait for shutdown signal
+        done, pending = await asyncio.wait(
+            [bot_task, monitor_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # If shutdown was triggered, stop everything
+        logger.info("Initiating shutdown...")
+        await monitor.stop()
+
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received")
+        await monitor.stop()
+
     finally:
         # ── Cleanup ────────────────────────────────────────
         logger.info("Cleaning up resources...")
+
+        # Cancel pending tasks
+        bot_task.cancel()
+        monitor_task.cancel()
+
+        # Stop services
+        await telegram_bot.stop()
         await checker.close()
-        await notifier.close()
         await db_manager.close()
+
         logger.info("Shutdown complete")
 
 

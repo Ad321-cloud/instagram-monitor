@@ -7,6 +7,8 @@ Design Decisions:
     - server_default=func.now() for timestamps — delegated to the DB for consistency.
     - cascade="all, delete-orphan" on history relationship — if a username is hard-deleted,
       its history goes with it. Soft deletes preserve everything.
+    - follower_count tracked on both the current record AND history entries — allows
+      tracking follower changes over time alongside status changes.
 """
 
 from datetime import datetime
@@ -27,7 +29,7 @@ class UsernameStatus(str, Enum):
     States:
         ACTIVE: Profile exists and is publicly accessible (HTTP 200).
         AVAILABLE: Username is not taken (HTTP 404).
-        UNAVAILABLE: Profile is private, suspended, or blocked (HTTP 301/302).
+        UNAVAILABLE: Profile is disabled, suspended, or blocked (HTTP 301/302).
         UNKNOWN: Could not determine status (rate limited, network error, etc).
     """
 
@@ -46,17 +48,20 @@ class Base(DeclarativeBase):
 class MonitoredUsername(Base):
     """An Instagram username being monitored for state changes.
 
-    Tracks the current status, monitoring configuration (active/inactive),
+    Tracks the current status, follower count, monitoring configuration,
     and links to the full status change history.
 
     Attributes:
         id: Auto-incrementing primary key.
         username: Instagram username (max 30 chars per IG rules), unique and indexed.
         current_status: Most recently observed status.
+        follower_count: Last known follower count (None if never retrieved).
         is_active: Whether this username is actively being monitored.
         created_at: When this username was added to monitoring.
         updated_at: When this record was last modified.
         last_checked_at: When the last check was performed.
+        disabled_at: When the profile was last detected as disabled/unavailable.
+        returned_at: When the profile last came back from being disabled.
         history: All status change records for this username.
     """
 
@@ -69,6 +74,7 @@ class MonitoredUsername(Base):
     current_status: Mapped[str] = mapped_column(
         String(20), default=UsernameStatus.UNKNOWN.value
     )
+    follower_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     created_at: Mapped[datetime] = mapped_column(
@@ -78,6 +84,13 @@ class MonitoredUsername(Base):
         DateTime(timezone=True), onupdate=func.now(), nullable=True
     )
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Track exact times of disable/return events
+    disabled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    returned_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -93,7 +106,8 @@ class MonitoredUsername(Base):
         """Human-readable representation for debugging."""
         return (
             f"<MonitoredUsername(username='{self.username}', "
-            f"status='{self.current_status}', active={self.is_active})>"
+            f"status='{self.current_status}', followers={self.follower_count}, "
+            f"active={self.is_active})>"
         )
 
 
@@ -101,14 +115,15 @@ class StatusHistory(Base):
     """A single status check record for a monitored username.
 
     Created whenever a username's status changes (or on first check).
-    Stores both the old and new status, plus diagnostic metadata like
-    HTTP status code and response time for debugging.
+    Stores both the old and new status, follower count at the time,
+    plus diagnostic metadata like HTTP status code and response time.
 
     Attributes:
         id: Auto-incrementing primary key.
         username_id: Foreign key to the monitored username.
         old_status: Previous status (None for first check).
         new_status: Newly observed status.
+        follower_count: Follower count at the time of this check.
         checked_at: When this check was performed.
         http_status_code: HTTP response code from Instagram.
         response_time_ms: Round-trip time in milliseconds.
@@ -125,6 +140,7 @@ class StatusHistory(Base):
 
     old_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     new_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    follower_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     checked_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -142,5 +158,6 @@ class StatusHistory(Base):
         """Human-readable representation for debugging."""
         return (
             f"<StatusHistory(username_id={self.username_id}, "
-            f"'{self.old_status}' -> '{self.new_status}')>"
+            f"'{self.old_status}' -> '{self.new_status}', "
+            f"followers={self.follower_count})>"
         )

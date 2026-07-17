@@ -1,26 +1,34 @@
-"""Telegram notification system for Instagram monitoring alerts.
+"""Interactive Telegram bot for controlling the Instagram monitoring system.
 
 Design Decisions:
-    - python-telegram-bot v20+ (async native) — no sync-to-async wrappers needed.
-    - Lazy bot initialization — avoids hitting Telegram API at import time.
-    - HTML parse mode — more readable and flexible than MarkdownV2 (no escaping hell).
-    - Each method returns bool — callers decide whether to retry or log failures.
-    - tenacity retry on send — Telegram's API occasionally returns 5xx or has
-      transient network issues. 3 retries with backoff handles this gracefully.
-    - All errors caught and logged — Telegram failures should never crash the monitor.
+    - python-telegram-bot v20+ Application with command handlers — the bot IS the
+      user interface, not just a notification channel.
+    - Commands: /monitor, /demonitor, /status, /list, /check, /help
+    - Each command handler receives the shared checker + repository via application
+      context (bot_data) — no globals.
+    - The bot runs its polling loop concurrently with the monitoring scheduler.
+    - All responses use HTML parse mode for rich formatting.
+    - Immediate check on /monitor — user gets instant feedback, not "added, wait 5min".
 """
 
 from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
+from telegram import Bot, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
-from telegram import Bot
 from telegram.error import TelegramError
 
 
@@ -32,50 +40,437 @@ _STATUS_EMOJI: dict[str, str] = {
     "unknown": "⚪",
 }
 
-# Status display names for messages
 _STATUS_DISPLAY: dict[str, str] = {
     "active": "ACTIVE",
     "available": "AVAILABLE",
-    "unavailable": "UNAVAILABLE",
+    "unavailable": "UNAVAILABLE / DISABLED",
     "unknown": "UNKNOWN",
 }
 
 
-class TelegramNotifier:
-    """Sends formatted notifications to a Telegram chat.
+def _format_followers(count: Optional[int]) -> str:
+    """Format follower count for display.
 
-    Handles status change alerts, startup notifications, error alerts,
-    and generic messages. All methods are async and return bool indicating
-    success/failure.
+    Args:
+        count: Raw follower count or None.
 
-    Usage:
-        notifier = TelegramNotifier(bot_token="...", chat_id="...")
-        await notifier.send_startup_notification()
-        await notifier.send_status_change("target_user", "active", "available")
+    Returns:
+        Formatted string like "1.2K", "3.5M", or "N/A".
+    """
+    if count is None:
+        return "N/A"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    elif count >= 1_000:
+        return f"{count / 1_000:.1f}K"
+    return str(count)
+
+
+def _format_time(dt: Optional[datetime]) -> str:
+    """Format a datetime for display.
+
+    Args:
+        dt: Datetime object or None.
+
+    Returns:
+        Formatted timestamp string or "Never".
+    """
+    if dt is None:
+        return "Never"
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+class TelegramBot:
+    """Interactive Telegram bot for controlling the Instagram monitor.
+
+    Provides command handlers for:
+        /monitor <username> — Start monitoring a username (+ immediate check)
+        /demonitor <username> — Stop monitoring a username
+        /status <username> — Check current status of a username
+        /list — List all monitored usernames
+        /check — Run a check cycle on all active usernames
+        /help — Show available commands
+
+    Also provides methods for the scheduler to send notifications:
+        send_status_change() — Alert on state changes
+        send_error_alert() — Alert on errors
+
+    Attributes:
+        _bot_token: Telegram bot API token.
+        _chat_id: Authorized chat ID for commands and notifications.
+        _app: python-telegram-bot Application instance.
+        _repository: Database repository (set during setup).
+        _checker: Instagram checker (set during setup).
     """
 
     def __init__(self, bot_token: str, chat_id: str) -> None:
-        """Initialize the Telegram notifier.
+        """Initialize the bot.
 
         Args:
             bot_token: Telegram bot API token from @BotFather.
-            chat_id: Telegram chat ID to send messages to.
+            chat_id: Authorized Telegram chat ID.
         """
-        self._bot_token: str = bot_token
-        self._chat_id: str = chat_id
+        self._bot_token = bot_token
+        self._chat_id = chat_id
+        self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
 
-    async def _get_bot(self) -> Bot:
-        """Get or create the Telegram Bot instance.
+        # These are set via setup() before the bot starts
+        self._repository = None
+        self._checker = None
 
-        Lazily initialized to avoid API calls at construction time.
+    def setup(self, repository: "UsernameRepository", checker: "InstagramChecker") -> None:  # noqa: F821
+        """Inject dependencies before starting the bot.
+
+        Args:
+            repository: Database repository for username operations.
+            checker: Instagram checker for status checks.
+        """
+        self._repository = repository
+        self._checker = checker
+
+    async def _build_app(self) -> Application:
+        """Build the telegram Application with command handlers.
 
         Returns:
-            The python-telegram-bot Bot instance.
+            Configured Application instance.
         """
-        if self._bot is None:
-            self._bot = Bot(token=self._bot_token)
-        return self._bot
+        app = (
+            Application.builder()
+            .token(self._bot_token)
+            .build()
+        )
+
+        # Store dependencies in bot_data for handler access
+        app.bot_data["repository"] = self._repository
+        app.bot_data["checker"] = self._checker
+        app.bot_data["chat_id"] = self._chat_id
+
+        # Register command handlers
+        app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(CommandHandler("help", self._cmd_help))
+        app.add_handler(CommandHandler("monitor", self._cmd_monitor))
+        app.add_handler(CommandHandler("demonitor", self._cmd_demonitor))
+        app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("list", self._cmd_list))
+        app.add_handler(CommandHandler("check", self._cmd_check))
+
+        # Catch unknown commands
+        app.add_handler(MessageHandler(filters.COMMAND, self._cmd_unknown))
+
+        return app
+
+    # ── Command Handlers ──────────────────────────────────────────────
+
+    @staticmethod
+    async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start command."""
+        msg = (
+            "🔍 <b>Instagram Monitor Bot</b>\n"
+            "\n"
+            "I monitor Instagram usernames and alert you when they change state.\n"
+            "\n"
+            "📋 <b>Commands:</b>\n"
+            "/monitor <code>username</code> — Start monitoring\n"
+            "/demonitor <code>username</code> — Stop monitoring\n"
+            "/status <code>username</code> — Check status now\n"
+            "/list — Show all monitored usernames\n"
+            "/check — Run a check on all usernames\n"
+            "/help — Show this message"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command."""
+        msg = (
+            "📖 <b>Commands</b>\n"
+            "\n"
+            "▸ <code>/monitor username</code>\n"
+            "  Start monitoring an Instagram username.\n"
+            "  Does an immediate check and shows current status.\n"
+            "\n"
+            "▸ <code>/demonitor username</code>\n"
+            "  Stop monitoring a username.\n"
+            "\n"
+            "▸ <code>/status username</code>\n"
+            "  Check a username's current status right now.\n"
+            "  Shows: status, followers, disabled/returned times.\n"
+            "\n"
+            "▸ <code>/list</code>\n"
+            "  Show all monitored usernames with their status.\n"
+            "\n"
+            "▸ <code>/check</code>\n"
+            "  Run a check cycle on all active usernames.\n"
+            "\n"
+            "💡 <b>Status meanings:</b>\n"
+            "🟢 Active — Profile is live and public\n"
+            "🔵 Available — Username is not taken\n"
+            "🔴 Unavailable — Disabled / suspended / private\n"
+            "⚪ Unknown — Could not determine (rate limited)"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /monitor <username> command.
+
+        Adds the username to monitoring and does an immediate check.
+        """
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ Usage: <code>/monitor username</code>", parse_mode="HTML"
+            )
+            return
+
+        username = context.args[0].lower().strip().lstrip("@")
+        repo = context.bot_data["repository"]
+        checker = context.bot_data["checker"]
+
+        # Check if already monitored
+        existing = await repo.get_by_username(username)
+        if existing and existing.is_active:
+            await update.message.reply_text(
+                f"⚠️ <b>@{username}</b> is already being monitored.",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            # Reactivate or add new
+            if existing and not existing.is_active:
+                await repo.reactivate_username(username)
+                await update.message.reply_text(
+                    f"♻️ <b>@{username}</b> reactivated for monitoring.",
+                    parse_mode="HTML",
+                )
+            else:
+                await repo.add_username(username)
+                await update.message.reply_text(
+                    f"✅ <b>@{username}</b> added to monitoring.",
+                    parse_mode="HTML",
+                )
+
+            # Immediate check
+            await update.message.reply_text("🔄 Checking now...", parse_mode="HTML")
+            result = await checker.check_username(username)
+            emoji = _STATUS_EMOJI.get(result.status, "⚪")
+            display = _STATUS_DISPLAY.get(result.status, result.status.upper())
+            followers = _format_followers(result.follower_count)
+
+            # Update DB with first check result
+            from app.models.username import UsernameStatus
+            try:
+                status_enum = UsernameStatus(result.status)
+            except ValueError:
+                status_enum = UsernameStatus.UNKNOWN
+
+            await repo.update_status(
+                username=username,
+                new_status=status_enum,
+                http_code=result.http_status_code,
+                response_time=result.response_time_ms,
+                follower_count=result.follower_count,
+            )
+
+            msg = (
+                f"{emoji} <b>@{username}</b>\n"
+                f"\n"
+                f"Status: <b>{display}</b>\n"
+                f"Followers: <b>{followers}</b>\n"
+                f"HTTP: {result.http_status_code or 'N/A'} | "
+                f"Response: {result.response_time_ms:.0f}ms\n"
+                f"\n"
+                f"🔗 <a href='https://instagram.com/{username}'>View Profile</a>\n"
+                f"🕐 {_format_time(result.checked_at)}\n"
+                f"\n"
+                f"📡 Now monitoring — you'll be notified of any changes."
+            )
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+        except Exception as e:
+            logger.error("Error in /monitor for {}: {}", username, e)
+            await update.message.reply_text(
+                f"❌ Error: {e}", parse_mode="HTML"
+            )
+
+    @staticmethod
+    async def _cmd_demonitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /demonitor <username> command."""
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ Usage: <code>/demonitor username</code>", parse_mode="HTML"
+            )
+            return
+
+        username = context.args[0].lower().strip().lstrip("@")
+        repo = context.bot_data["repository"]
+
+        try:
+            removed = await repo.remove_username(username)
+            if removed:
+                await update.message.reply_text(
+                    f"🛑 <b>@{username}</b> removed from monitoring.",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ <b>@{username}</b> is not being monitored.",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.error("Error in /demonitor for {}: {}", username, e)
+            await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /status <username> command.
+
+        Does a live check and shows current status with details.
+        """
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ Usage: <code>/status username</code>", parse_mode="HTML"
+            )
+            return
+
+        username = context.args[0].lower().strip().lstrip("@")
+        checker = context.bot_data["checker"]
+        repo = context.bot_data["repository"]
+
+        await update.message.reply_text("🔄 Checking...", parse_mode="HTML")
+
+        try:
+            result = await checker.check_username(username)
+            emoji = _STATUS_EMOJI.get(result.status, "⚪")
+            display = _STATUS_DISPLAY.get(result.status, result.status.upper())
+            followers = _format_followers(result.follower_count)
+
+            # Get stored data for disable/return times
+            db_record = await repo.get_by_username(username)
+
+            msg = f"{emoji} <b>@{username}</b>\n\n"
+            msg += f"Status: <b>{display}</b>\n"
+            msg += f"Followers: <b>{followers}</b>\n"
+            msg += f"HTTP: {result.http_status_code or 'N/A'} | Response: {result.response_time_ms:.0f}ms\n"
+
+            if db_record:
+                msg += "\n"
+                if db_record.disabled_at:
+                    msg += f"🔴 Last disabled: <b>{_format_time(db_record.disabled_at)}</b>\n"
+                if db_record.returned_at:
+                    msg += f"🟢 Last returned: <b>{_format_time(db_record.returned_at)}</b>\n"
+                if db_record.last_checked_at:
+                    msg += f"🕐 Last checked: {_format_time(db_record.last_checked_at)}\n"
+
+            msg += f"\n🔗 <a href='https://instagram.com/{username}'>View Profile</a>"
+            msg += f"\n🕐 Checked: {_format_time(result.checked_at)}"
+
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+        except Exception as e:
+            logger.error("Error in /status for {}: {}", username, e)
+            await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /list command — show all monitored usernames."""
+        repo = context.bot_data["repository"]
+
+        try:
+            usernames = await repo.get_all_active()
+
+            if not usernames:
+                await update.message.reply_text(
+                    "📋 No usernames are being monitored.\n\n"
+                    "Use <code>/monitor username</code> to add one.",
+                    parse_mode="HTML",
+                )
+                return
+
+            msg = f"📋 <b>Monitored Usernames</b> ({len(usernames)})\n\n"
+
+            for u in usernames:
+                emoji = _STATUS_EMOJI.get(u.current_status, "⚪")
+                followers = _format_followers(u.follower_count)
+                last_check = (
+                    u.last_checked_at.strftime("%m/%d %H:%M")
+                    if u.last_checked_at
+                    else "Never"
+                )
+                msg += f"{emoji} <b>@{u.username}</b> — {u.current_status.upper()}"
+                msg += f" | 👥 {followers} | ⏱ {last_check}\n"
+
+                # Show disable/return info if available
+                if u.disabled_at:
+                    msg += f"   🔴 Disabled: {_format_time(u.disabled_at)}\n"
+                if u.returned_at:
+                    msg += f"   🟢 Returned: {_format_time(u.returned_at)}\n"
+
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+        except Exception as e:
+            logger.error("Error in /list: {}", e)
+            await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /check command — run a check cycle on all active usernames."""
+        repo = context.bot_data["repository"]
+        checker = context.bot_data["checker"]
+
+        try:
+            usernames = await repo.get_all_active()
+            if not usernames:
+                await update.message.reply_text(
+                    "📋 No active usernames to check.", parse_mode="HTML"
+                )
+                return
+
+            username_list = [u.username for u in usernames]
+            await update.message.reply_text(
+                f"🔄 Checking {len(username_list)} usernames...\nThis may take a moment.",
+                parse_mode="HTML",
+            )
+
+            results = await checker.check_many(username_list, max_concurrent=3)
+
+            msg = "📊 <b>Check Results</b>\n\n"
+            for result in results:
+                emoji = _STATUS_EMOJI.get(result.status, "⚪")
+                followers = _format_followers(result.follower_count)
+                msg += f"{emoji} <b>@{result.username}</b> — {result.status.upper()} | 👥 {followers}\n"
+
+                # Update DB
+                from app.models.username import UsernameStatus
+                try:
+                    status_enum = UsernameStatus(result.status)
+                except ValueError:
+                    status_enum = UsernameStatus.UNKNOWN
+
+                await repo.update_status(
+                    username=result.username,
+                    new_status=status_enum,
+                    http_code=result.http_status_code,
+                    response_time=result.response_time_ms,
+                    follower_count=result.follower_count,
+                )
+
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+        except Exception as e:
+            logger.error("Error in /check: {}", e)
+            await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle unknown commands."""
+        await update.message.reply_text(
+            "❓ Unknown command. Use /help to see available commands.",
+            parse_mode="HTML",
+        )
+
+    # ── Notification Methods (called by the scheduler) ────────────────
 
     @retry(
         stop=stop_after_attempt(3),
@@ -86,19 +481,15 @@ class TelegramNotifier:
     async def _send_message(self, text: str) -> bool:
         """Send a message via Telegram with retry logic.
 
-        Uses HTML parse mode for rich formatting.
-
         Args:
             text: HTML-formatted message text.
 
         Returns:
-            True if the message was sent successfully.
-
-        Raises:
-            TelegramError: After all retry attempts exhausted.
+            True if sent successfully.
         """
-        bot = await self._get_bot()
-        await bot.send_message(
+        if self._bot is None:
+            self._bot = Bot(token=self._bot_token)
+        await self._bot.send_message(
             chat_id=self._chat_id,
             text=text,
             parse_mode="HTML",
@@ -110,92 +501,91 @@ class TelegramNotifier:
         username: str,
         old_status: str,
         new_status: str,
+        follower_count: Optional[int] = None,
+        disabled_at: Optional[datetime] = None,
+        returned_at: Optional[datetime] = None,
     ) -> bool:
         """Send a status change notification.
 
-        Formats a rich message with emoji indicators, Instagram link,
-        and timestamp.
+        Includes follower count and exact disable/return timestamps.
 
         Args:
-            username: The Instagram username that changed state.
-            old_status: The previous status value.
-            new_status: The new status value.
+            username: The Instagram username.
+            old_status: Previous status.
+            new_status: New status.
+            follower_count: Current follower count if available.
+            disabled_at: When the profile was disabled.
+            returned_at: When the profile returned.
 
         Returns:
-            True if the notification was sent, False on failure.
+            True if sent, False on failure.
         """
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         new_emoji = _STATUS_EMOJI.get(new_status, "⚪")
         old_emoji = _STATUS_EMOJI.get(old_status, "⚪")
         new_display = _STATUS_DISPLAY.get(new_status, new_status.upper())
         old_display = _STATUS_DISPLAY.get(old_status, old_status.upper())
+        followers = _format_followers(follower_count)
 
-        # Determine headline based on new status
-        if new_status == "available":
+        # Determine headline and details based on transition
+        if new_status == "unavailable":
+            headline = "🔴 Profile Disabled!"
+            detail = f"<b>@{username}</b> has been <b>DISABLED</b>"
+            if disabled_at:
+                detail += f"\n⏰ Disabled at: <b>{_format_time(disabled_at)}</b>"
+        elif old_status == "unavailable" and new_status == "active":
+            headline = "🟢 Profile Returned!"
+            detail = f"<b>@{username}</b> is <b>BACK ONLINE</b>"
+            if returned_at:
+                detail += f"\n⏰ Returned at: <b>{_format_time(returned_at)}</b>"
+            if disabled_at:
+                detail += f"\n🔴 Was disabled since: {_format_time(disabled_at)}"
+        elif new_status == "available":
             headline = "🔵 Username Available!"
+            detail = f"<b>@{username}</b> is now <b>AVAILABLE</b>"
         elif new_status == "active":
             headline = "🟢 Username Active"
-        elif new_status == "unavailable":
-            headline = "🔴 Username Unavailable"
+            detail = f"<b>@{username}</b> is now <b>ACTIVE</b>"
         else:
             headline = "⚪ Status Changed"
+            detail = f"<b>@{username}</b> status changed"
 
         message = (
             f"<b>{headline}</b>\n"
             f"\n"
-            f"<b>@{username}</b> is now <b>{new_display}</b>\n"
+            f"{detail}\n"
+            f"\n"
             f"Previous: {old_emoji} {old_display}\n"
+            f"Current: {new_emoji} {new_display}\n"
+            f"👥 Followers: <b>{followers}</b>\n"
             f"\n"
             f"🔗 <a href='https://instagram.com/{username}'>View Profile</a>\n"
-            f"🕐 {now}"
+            f"🕐 {now_str}"
         )
 
         try:
             await self._send_message(message)
             logger.info(
-                "Telegram notification sent: {} status {} -> {}",
-                username,
-                old_status,
-                new_status,
+                "Status change notification sent: {} {} -> {}",
+                username, old_status, new_status,
             )
             return True
         except Exception as e:
-            logger.error(
-                "Failed to send Telegram notification for {}: {}",
-                username,
-                e,
-            )
-            return False
-
-    async def send_alert(self, message: str) -> bool:
-        """Send a generic alert message.
-
-        Args:
-            message: Plain text message content.
-
-        Returns:
-            True if sent successfully, False on failure.
-        """
-        text = f"ℹ️ <b>Monitor Alert</b>\n\n{message}"
-        try:
-            await self._send_message(text)
-            logger.info("Alert sent: {}", message[:50])
-            return True
-        except Exception as e:
-            logger.error("Failed to send alert: {}", e)
+            logger.error("Failed to send notification for {}: {}", username, e)
             return False
 
     async def send_startup_notification(self) -> bool:
-        """Send a notification that the monitoring service has started.
+        """Send a notification that the monitor has started.
 
         Returns:
-            True if sent successfully, False on failure.
+            True if sent, False on failure.
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         message = (
             "🚀 <b>Instagram Monitor Started</b>\n"
             "\n"
             "The monitoring service is now running.\n"
+            "Use /list to see monitored usernames.\n"
             f"🕐 {now}"
         )
         try:
@@ -207,32 +597,53 @@ class TelegramNotifier:
             return False
 
     async def send_error_alert(self, error: str) -> bool:
-        """Send an error notification for critical failures.
+        """Send an error notification.
 
         Args:
             error: Error description.
 
         Returns:
-            True if sent successfully, False on failure.
+            True if sent, False on failure.
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         message = (
             "⚠️ <b>Monitor Error</b>\n"
             "\n"
-            f"<code>{error}</code>\n"
+            f"<code>{error[:500]}</code>\n"
             f"\n"
             f"🕐 {now}"
         )
         try:
             await self._send_message(message)
-            logger.warning("Error alert sent: {}", error[:50])
             return True
         except Exception as e:
             logger.error("Failed to send error alert: {}", e)
             return False
 
-    async def close(self) -> None:
-        """Clean up the bot instance."""
-        if self._bot:
-            logger.debug("Telegram notifier closed")
-            self._bot = None
+    # ── Lifecycle Methods ─────────────────────────────────────────────
+
+    async def start(self) -> Application:
+        """Build, initialize, and start the bot polling.
+
+        Returns:
+            The running Application instance.
+        """
+        logger.info("Starting Telegram bot")
+        self._app = await self._build_app()
+        self._bot = self._app.bot
+
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling(drop_pending_updates=True)
+
+        logger.info("Telegram bot is now polling for commands")
+        return self._app
+
+    async def stop(self) -> None:
+        """Stop the bot polling and shutdown."""
+        if self._app:
+            logger.info("Stopping Telegram bot")
+            await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+            logger.info("Telegram bot stopped")

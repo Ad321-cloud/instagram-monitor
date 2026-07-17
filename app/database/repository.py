@@ -1,15 +1,14 @@
 """Repository pattern for database operations.
 
 Design Decisions:
-    - Repository pattern decouples business logic from data access — the monitor
-      doesn't need to know SQL, just call repo.update_status().
-    - Each method creates its own session via the factory — no session leaks,
-      no shared mutable state between operations.
-    - Status history is only created when the status actually changes — avoids
-      flooding the history table with redundant "still active" entries.
-    - Soft delete (is_active=False) preserves history for deactivated usernames.
+    - Repository pattern decouples business logic from data access.
+    - Each method creates its own session — no session leaks.
+    - Status history only created when status changes — avoids flooding.
+    - disabled_at/returned_at tracked with exact timestamps for user-facing reports.
+    - follower_count stored on both current record and history entries.
 """
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
@@ -23,11 +22,8 @@ from app.models.username import MonitoredUsername, StatusHistory, UsernameStatus
 class UsernameRepository:
     """Handles all database operations for monitored usernames and their history.
 
-    Encapsulates CRUD operations and status tracking behind a clean async interface.
-    Each method manages its own session lifecycle — no transaction leaks.
-
     Attributes:
-        _session_factory: SQLAlchemy async session factory for creating sessions.
+        _session_factory: SQLAlchemy async session factory.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -50,30 +46,30 @@ class UsernameRepository:
         Raises:
             sqlalchemy.exc.IntegrityError: If the username already exists.
         """
-        logger.info("Adding username to monitoring: {}", username)
+        clean = username.lower().strip().lstrip("@")
+        logger.info("Adding username to monitoring: {}", clean)
         async with self._session_factory() as session:
-            new_username = MonitoredUsername(username=username.lower().strip())
+            new_username = MonitoredUsername(username=clean)
             session.add(new_username)
             await session.commit()
             await session.refresh(new_username)
-            logger.info("Username added successfully: {} (id={})", username, new_username.id)
+            logger.info("Username added: {} (id={})", clean, new_username.id)
             return new_username
 
     async def remove_username(self, username: str) -> bool:
         """Soft-delete a username by setting is_active=False.
 
-        Preserves all history data. The username can be reactivated later.
-
         Args:
             username: The username to deactivate.
 
         Returns:
-            True if the username was found and deactivated, False if not found.
+            True if found and deactivated, False if not found.
         """
-        logger.info("Soft-deleting username: {}", username)
+        clean = username.lower().strip().lstrip("@")
+        logger.info("Soft-deleting username: {}", clean)
         async with self._session_factory() as session:
             stmt = select(MonitoredUsername).where(
-                MonitoredUsername.username == username.lower().strip()
+                MonitoredUsername.username == clean
             )
             result = await session.execute(stmt)
             db_username = result.scalar_one_or_none()
@@ -81,10 +77,35 @@ class UsernameRepository:
             if db_username:
                 db_username.is_active = False
                 await session.commit()
-                logger.info("Username deactivated: {}", username)
+                logger.info("Username deactivated: {}", clean)
                 return True
 
-            logger.warning("Username not found for removal: {}", username)
+            logger.warning("Username not found for removal: {}", clean)
+            return False
+
+    async def reactivate_username(self, username: str) -> bool:
+        """Reactivate a previously deactivated username.
+
+        Args:
+            username: The username to reactivate.
+
+        Returns:
+            True if found and reactivated, False if not found.
+        """
+        clean = username.lower().strip().lstrip("@")
+        async with self._session_factory() as session:
+            stmt = select(MonitoredUsername).where(
+                MonitoredUsername.username == clean
+            )
+            result = await session.execute(stmt)
+            db_username = result.scalar_one_or_none()
+
+            if db_username and not db_username.is_active:
+                db_username.is_active = True
+                db_username.current_status = UsernameStatus.UNKNOWN.value
+                await session.commit()
+                logger.info("Username reactivated: {}", clean)
+                return True
             return False
 
     async def get_all_active(self) -> list[MonitoredUsername]:
@@ -122,9 +143,10 @@ class UsernameRepository:
         Returns:
             The MonitoredUsername record if found, None otherwise.
         """
+        clean = username.lower().strip().lstrip("@")
         async with self._session_factory() as session:
             stmt = select(MonitoredUsername).where(
-                MonitoredUsername.username == username.lower().strip()
+                MonitoredUsername.username == clean
             )
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
@@ -135,52 +157,71 @@ class UsernameRepository:
         new_status: UsernameStatus,
         http_code: Optional[int] = None,
         response_time: Optional[float] = None,
+        follower_count: Optional[int] = None,
         error: Optional[str] = None,
     ) -> Optional[StatusHistory]:
         """Update username status and create a history entry if status changed.
 
-        Always updates last_checked_at. Only creates a StatusHistory entry
-        when the status actually changes — this prevents the history table
-        from filling up with redundant "still active" entries.
+        Also tracks disabled_at and returned_at timestamps:
+        - When status changes TO unavailable → sets disabled_at
+        - When status changes FROM unavailable TO active → sets returned_at
 
         Args:
             username: The username that was checked.
             new_status: The newly observed status.
-            http_code: HTTP response code from the check (for diagnostics).
-            response_time: Response time in milliseconds (for diagnostics).
+            http_code: HTTP response code.
+            response_time: Response time in milliseconds.
+            follower_count: Follower count if available.
             error: Error message if the check failed.
 
         Returns:
-            The StatusHistory entry if a state change occurred, None otherwise.
-            Also returns None if the username wasn't found in the database.
+            StatusHistory entry if state changed, None otherwise.
         """
-        logger.debug("Updating status for {} to {}", username, new_status.value)
+        clean = username.lower().strip().lstrip("@")
+        logger.debug("Updating status for {} to {}", clean, new_status.value)
+
         async with self._session_factory() as session:
             stmt = select(MonitoredUsername).where(
-                MonitoredUsername.username == username.lower().strip()
+                MonitoredUsername.username == clean
             )
             result = await session.execute(stmt)
             db_username = result.scalar_one_or_none()
 
             if not db_username:
-                logger.error("Cannot update status: username not found: {}", username)
+                logger.error("Cannot update status: username not found: {}", clean)
                 return None
 
             old_status = db_username.current_status
+            now = datetime.now(timezone.utc)
             history_entry: Optional[StatusHistory] = None
+
+            # Update follower count if we got one
+            if follower_count is not None:
+                db_username.follower_count = follower_count
 
             # Only create history entry if status actually changed
             if old_status != new_status.value:
                 logger.info(
                     "Status CHANGED for {}: {} -> {}",
-                    username,
-                    old_status,
-                    new_status.value,
+                    clean, old_status, new_status.value,
                 )
+
+                # Track exact disable/return timestamps
+                if new_status == UsernameStatus.UNAVAILABLE:
+                    db_username.disabled_at = now
+                    logger.warning("Profile DISABLED: {} at {}", clean, now.isoformat())
+                elif (
+                    old_status == UsernameStatus.UNAVAILABLE.value
+                    and new_status == UsernameStatus.ACTIVE
+                ):
+                    db_username.returned_at = now
+                    logger.info("Profile RETURNED: {} at {}", clean, now.isoformat())
+
                 history_entry = StatusHistory(
                     username_id=db_username.id,
                     old_status=old_status if old_status != UsernameStatus.UNKNOWN.value else None,
                     new_status=new_status.value,
+                    follower_count=follower_count,
                     http_status_code=http_code,
                     response_time_ms=response_time,
                     error_message=error,
@@ -188,8 +229,8 @@ class UsernameRepository:
                 session.add(history_entry)
                 db_username.current_status = new_status.value
 
-            # Always update the last checked timestamp
-            db_username.last_checked_at = func.now()
+            # Always update last checked timestamp
+            db_username.last_checked_at = now
 
             await session.commit()
 
@@ -210,6 +251,7 @@ class UsernameRepository:
         Returns:
             List of StatusHistory entries, newest first.
         """
+        clean = username.lower().strip().lstrip("@")
         async with self._session_factory() as session:
             stmt = (
                 select(StatusHistory)
@@ -217,7 +259,7 @@ class UsernameRepository:
                     MonitoredUsername,
                     StatusHistory.username_id == MonitoredUsername.id,
                 )
-                .where(MonitoredUsername.username == username.lower().strip())
+                .where(MonitoredUsername.username == clean)
                 .order_by(StatusHistory.checked_at.desc())
                 .limit(limit)
             )
