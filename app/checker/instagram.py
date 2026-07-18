@@ -285,6 +285,14 @@ class InstagramChecker:
         try:
             http_status, response_time, body = await self._do_request(url)
             status = self._interpret_status(http_status)
+            
+            # Instagram often returns HTTP 200 for deactivated accounts but with a generic title
+            if status == "active" and body:
+                title_match = re.search(r"<title>(.*?)</title>", body, re.IGNORECASE)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    if title == "Instagram" or "Page Not Found" in title:
+                        status = "unavailable"
 
             # Extract follower count for active profiles
             follower_count: Optional[int] = None

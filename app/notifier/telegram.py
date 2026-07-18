@@ -13,6 +13,7 @@ Design Decisions:
 
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 from telegram import Bot, Update
@@ -67,7 +68,7 @@ def _format_followers(count: Optional[int]) -> str:
 
 
 def _format_time(dt: Optional[datetime]) -> str:
-    """Format a datetime for display.
+    """Format a datetime for display in IST.
 
     Args:
         dt: Datetime object or None.
@@ -77,7 +78,12 @@ def _format_time(dt: Optional[datetime]) -> str:
     """
     if dt is None:
         return "Never"
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+        
+    ist_dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    return ist_dt.strftime("%Y-%m-%d %H:%M:%S IST")
 
 
 class TelegramBot:
@@ -520,7 +526,7 @@ class TelegramBot:
         Returns:
             True if sent, False on failure.
         """
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
         new_emoji = _STATUS_EMOJI.get(new_status, "⚪")
         old_emoji = _STATUS_EMOJI.get(old_status, "⚪")
         new_display = _STATUS_DISPLAY.get(new_status, new_status.upper())
@@ -580,7 +586,7 @@ class TelegramBot:
         Returns:
             True if sent, False on failure.
         """
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
         message = (
             "🚀 <b>Instagram Monitor Started</b>\n"
             "\n"
@@ -605,7 +611,7 @@ class TelegramBot:
         Returns:
             True if sent, False on failure.
         """
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
         message = (
             "⚠️ <b>Monitor Error</b>\n"
             "\n"

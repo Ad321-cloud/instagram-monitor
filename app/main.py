@@ -9,10 +9,12 @@ Design Decisions:
 """
 
 import asyncio
+import os
 import signal
 from types import FrameType
 from typing import Optional
 
+from aiohttp import web
 from loguru import logger
 
 from app.checker.instagram import InstagramChecker
@@ -93,6 +95,28 @@ async def run_service() -> None:
         await asyncio.sleep(2)
         await monitor.start()
 
+    async def _run_web_server() -> None:
+        """Start a dummy web server for Render/UptimeRobot pings."""
+        async def handle_ping(request):
+            return web.Response(text="Instagram Monitor is alive!")
+            
+        port = int(os.environ.get("PORT", 10000))
+        app = web.Application()
+        app.router.add_get("/", handle_ping)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        
+        logger.info("Started dummy web server on port {}", port)
+        await site.start()
+        
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await runner.cleanup()
+
     # Signal handling for graceful shutdown
     shutdown_event = asyncio.Event()
 
@@ -105,17 +129,22 @@ async def run_service() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Run bot, monitor, and shutdown watcher concurrently
+    # Run bot, monitor, web server, and shutdown watcher concurrently
     bot_task = asyncio.create_task(_run_bot())
     monitor_task = asyncio.create_task(_run_monitor())
+    web_task = asyncio.create_task(_run_web_server())
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
     try:
         # Wait for shutdown signal
         done, pending = await asyncio.wait(
-            [bot_task, monitor_task, shutdown_task],
+            [bot_task, monitor_task, web_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
+
+        for task in done:
+            if not task.cancelled() and task.exception():
+                logger.error("A critical task failed: {}", task.exception())
 
         # If shutdown was triggered, stop everything
         logger.info("Initiating shutdown...")
@@ -132,6 +161,7 @@ async def run_service() -> None:
         # Cancel pending tasks
         bot_task.cancel()
         monitor_task.cancel()
+        web_task.cancel()
 
         # Stop services
         await telegram_bot.stop()

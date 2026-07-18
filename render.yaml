@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: instagram-monitor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.cli run
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # The following must be filled out in the Render Dashboard
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

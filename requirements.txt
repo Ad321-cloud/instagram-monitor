@@ -8,6 +8,7 @@ python-telegram-bot>=20.0,<22.0
 loguru>=0.7,<1.0
 python-dotenv>=1.0,<2.0
 tenacity>=8.0,<10.0
+brotli>=1.1,<2.0
 
 # Dev dependencies
 pytest>=8.0

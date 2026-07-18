@@ -1,0 +1,15 @@
+[Unit]
+Description=Instagram Monitor Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/instagram-monitor
+ExecStart=/home/ubuntu/instagram-monitor/venv/bin/python -m app.cli run
+Restart=always
+RestartSec=10
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
