@@ -32,6 +32,8 @@ from tenacity import (
 )
 from telegram.error import TelegramError
 
+from app.models.username import UsernameStatus
+
 
 # Emoji indicators for each status
 _STATUS_EMOJI: dict[str, str] = {
@@ -157,6 +159,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("monitor", self._cmd_monitor))
         app.add_handler(CommandHandler("demonitor", self._cmd_demonitor))
+        app.add_handler(CommandHandler("markactive", self._cmd_mark_active))
         app.add_handler(CommandHandler("status", self._cmd_status))
         app.add_handler(CommandHandler("list", self._cmd_list))
         app.add_handler(CommandHandler("check", self._cmd_check))
@@ -179,6 +182,7 @@ class TelegramBot:
             "📋 <b>Commands:</b>\n"
             "/monitor <code>username</code> — Start monitoring\n"
             "/demonitor <code>username</code> — Stop monitoring\n"
+            "/markactive <code>username</code> — Set a known-live profile active\n"
             "/status <code>username</code> — Check status now\n"
             "/list — Show all monitored usernames\n"
             "/check — Run a check on all usernames\n"
@@ -198,6 +202,9 @@ class TelegramBot:
             "\n"
             "▸ <code>/demonitor username</code>\n"
             "  Stop monitoring a username.\n"
+            "\n"
+            "▸ <code>/markactive username</code>\n"
+            "  Reset a known-live profile to ACTIVE when Instagram blocks Render checks.\n"
             "\n"
             "▸ <code>/status username</code>\n"
             "  Check a username's current status right now.\n"
@@ -326,6 +333,40 @@ class TelegramBot:
                 )
         except Exception as e:
             logger.error("Error in /demonitor for {}: {}", username, e)
+            await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+
+    @staticmethod
+    async def _cmd_mark_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Manually set a confirmed-live profile as the reliable baseline."""
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ Usage: <code>/markactive username</code>", parse_mode="HTML"
+            )
+            return
+
+        username = context.args[0].lower().strip().lstrip("@")
+        repo = context.bot_data["repository"]
+
+        try:
+            record = await repo.get_by_username(username)
+            if not record:
+                await update.message.reply_text(
+                    f"⚠️ <b>@{username}</b> is not being monitored. Use /monitor first.",
+                    parse_mode="HTML",
+                )
+                return
+
+            await repo.update_status(
+                username=username,
+                new_status=UsernameStatus.ACTIVE,
+            )
+            await update.message.reply_text(
+                f"🟢 <b>@{username}</b> set to ACTIVE.\n"
+                "Future blocked checks will retain this status.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Error marking {} active: {}", username, e)
             await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
 
     @staticmethod
