@@ -443,9 +443,7 @@ class TelegramBot:
 
             msg = "📊 <b>Check Results</b>\n\n"
             for result in results:
-                emoji = _STATUS_EMOJI.get(result.status, "⚪")
                 followers = _format_followers(result.follower_count)
-                msg += f"{emoji} <b>@{result.username}</b> — {result.status.upper()} | 👥 {followers}\n"
 
                 # Update DB
                 from app.models.username import UsernameStatus
@@ -460,6 +458,20 @@ class TelegramBot:
                     http_code=result.http_status_code,
                     response_time=result.response_time_ms,
                     follower_count=result.follower_count,
+                )
+
+                # If Instagram blocks the request, show the last reliable state.
+                stored = await repo.get_by_username(result.username)
+                display_status = (
+                    stored.current_status
+                    if result.status == "unknown" and stored
+                    else result.status
+                )
+                emoji = _STATUS_EMOJI.get(display_status, "⚪")
+                suffix = " (last reliable)" if display_status != result.status else ""
+                msg += (
+                    f"{emoji} <b>@{result.username}</b> — "
+                    f"{display_status.upper()}{suffix} | 👥 {followers}\n"
                 )
 
             await update.message.reply_text(msg, parse_mode="HTML")

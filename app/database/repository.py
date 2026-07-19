@@ -202,6 +202,26 @@ class UsernameRepository:
             # Instagram frequently blocks cloud IPs with login/challenge pages.
             # An unknown observation must not erase the last reliable state.
             if new_status == UsernameStatus.UNKNOWN:
+                if old_status == UsernameStatus.UNKNOWN.value:
+                    reliable_stmt = (
+                        select(StatusHistory.new_status)
+                        .where(
+                            StatusHistory.username_id == db_username.id,
+                            StatusHistory.new_status.in_(
+                                [
+                                    UsernameStatus.ACTIVE.value,
+                                    UsernameStatus.AVAILABLE.value,
+                                    UsernameStatus.UNAVAILABLE.value,
+                                ]
+                            ),
+                        )
+                        .order_by(StatusHistory.checked_at.desc())
+                        .limit(1)
+                    )
+                    reliable_result = await session.execute(reliable_stmt)
+                    reliable_status = reliable_result.scalar_one_or_none()
+                    if reliable_status:
+                        db_username.current_status = reliable_status
                 db_username.last_checked_at = now
                 await session.commit()
                 return None
