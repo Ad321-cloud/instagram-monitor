@@ -199,6 +199,13 @@ class UsernameRepository:
             if follower_count is not None:
                 db_username.follower_count = follower_count
 
+            # Instagram frequently blocks cloud IPs with login/challenge pages.
+            # An unknown observation must not erase the last reliable state.
+            if new_status == UsernameStatus.UNKNOWN:
+                db_username.last_checked_at = now
+                await session.commit()
+                return None
+
             # Only create history entry if status actually changed
             if old_status != new_status.value:
                 logger.info(
