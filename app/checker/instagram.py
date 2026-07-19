@@ -187,8 +187,9 @@ class InstagramChecker:
         elif http_status == 404:
             return "available"
         elif http_status in (301, 302, 303, 307, 308):
-            # Redirects to /accounts/login/ = disabled/suspended/private
-            return "unavailable"
+            # Redirects are commonly Instagram login/challenge/rate-limit pages.
+            # They do not prove that the profile is disabled.
+            return "unknown"
         elif http_status == 429:
             return "unknown"  # Rate limited
         else:
@@ -286,14 +287,6 @@ class InstagramChecker:
             http_status, response_time, body = await self._do_request(url)
             status = self._interpret_status(http_status)
             
-            # Instagram often returns HTTP 200 for deactivated accounts but with a generic title
-            if status == "active" and body:
-                title_match = re.search(r"<title>(.*?)</title>", body, re.IGNORECASE)
-                if title_match:
-                    title = title_match.group(1).strip()
-                    if title == "Instagram" or "Page Not Found" in title:
-                        status = "unavailable"
-
             # Extract follower count for active profiles
             follower_count: Optional[int] = None
             if status == "active" and body:

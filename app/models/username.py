@@ -29,8 +29,8 @@ class UsernameStatus(str, Enum):
     States:
         ACTIVE: Profile exists and is publicly accessible (HTTP 200).
         AVAILABLE: Username is not taken (HTTP 404).
-        UNAVAILABLE: Profile is disabled, suspended, or blocked (HTTP 301/302).
-        UNKNOWN: Could not determine status (rate limited, network error, etc).
+        UNAVAILABLE: Profile is confirmed unavailable (not used for redirects).
+        UNKNOWN: Could not determine status (login/challenge/rate limit/network).
     """
 
     ACTIVE = "active"

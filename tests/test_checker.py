@@ -58,9 +58,20 @@ class TestInstagramChecker:
         assert checker._interpret_status(404) == "available"
 
     def test_interpret_status_302(self) -> None:
-        """HTTP 302 redirect should map to 'unavailable'."""
+        """HTTP 302 redirect is ambiguous and should not disable a profile."""
         checker = InstagramChecker()
-        assert checker._interpret_status(302) == "unavailable"
+        assert checker._interpret_status(302) == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_http_200_login_page_is_not_marked_disabled(self) -> None:
+        """Instagram's generic 200 login page must not become unavailable."""
+        checker = InstagramChecker()
+        checker._do_request = AsyncMock(
+            return_value=(200, 120.0, "<html><title>Instagram</title></html>")
+        )
+        result = await checker.check_username("live_profile")
+        assert result.status == "active"
+        await checker.close()
 
     def test_interpret_status_429(self) -> None:
         """HTTP 429 rate limit should map to 'unknown'."""
