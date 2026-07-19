@@ -71,6 +71,43 @@ class TestSettings:
             assert s.database_url == "postgresql+asyncpg://custom:url@host/db"
 
     @patch.dict(os.environ, clear=True)
+    def test_database_url_render_name_override(self) -> None:
+        """Render's DATABASE_URL variable should override component settings."""
+        env = {
+            "DATABASE_URL": "postgres://user:password@pooler.supabase.com:5432/postgres?ssl=require",
+            "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+            "TELEGRAM_CHAT_ID": "987654321",
+        }
+        with patch.dict(os.environ, env):
+            from app.config.settings import Settings
+            s = Settings()
+            assert s.database_url == env["DATABASE_URL"].replace(
+                "postgres://", "postgresql+asyncpg://", 1
+            )
+
+    @patch.dict(os.environ, clear=True)
+    def test_database_components_remain_supported(self) -> None:
+        """Individual DB_* variables still construct the connection URL."""
+        env = self._make_env()
+        with patch.dict(os.environ, env):
+            from app.config.settings import Settings
+            s = Settings()
+            assert "db.test.supabase.co" in s.database_url
+
+    @patch.dict(os.environ, clear=True)
+    def test_strips_pasted_database_values(self) -> None:
+        """Dashboard values copied with surrounding whitespace remain usable."""
+        env = self._make_env(
+            DB_HOST="  aws-1-ap-south-1.pooler.supabase.com\n",
+            DB_PASSWORD=" password ",
+        )
+        with patch.dict(os.environ, env):
+            from app.config.settings import Settings
+            s = Settings()
+            assert s.db_host == "aws-1-ap-south-1.pooler.supabase.com"
+            assert s.db_password == "password"
+
+    @patch.dict(os.environ, clear=True)
     def test_defaults(self) -> None:
         """Default values should be applied for optional settings."""
         env = self._make_env()

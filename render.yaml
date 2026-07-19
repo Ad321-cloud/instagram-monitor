@@ -7,7 +7,8 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
-      # The following must be filled out in the Render Dashboard
+      # Paste the URI from Supabase Dashboard -> Connect -> Connection string -> URI.
+      # Use the pooler URI for Render and keep sslmode=require in the value.
       - key: DATABASE_URL
         sync: false
       - key: TELEGRAM_BOT_TOKEN

@@ -11,6 +11,7 @@ Design Decisions:
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,12 +40,16 @@ class Settings(BaseSettings):
     """
 
     # --- Supabase / PostgreSQL ---
-    db_host: str
+    db_host: Optional[str] = None
     db_port: int = 5432
     db_name: str = "postgres"
     db_user: str = "postgres"
-    db_password: str
-    db_url: Optional[str] = None
+    db_password: Optional[str] = None
+    # Render/Supabase use DATABASE_URL; DB_URL remains supported for local setups.
+    db_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("DATABASE_URL", "DB_URL"),
+    )
 
     # --- Telegram ---
     telegram_bot_token: str
@@ -64,6 +69,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        str_strip_whitespace=True,
     )
 
     @property
@@ -78,7 +84,16 @@ class Settings(BaseSettings):
             Async-compatible PostgreSQL connection string for asyncpg.
         """
         if self.db_url:
-            return self.db_url
+            # Supabase commonly displays postgres://; force the asyncpg dialect.
+            return self.db_url.replace(
+                "postgres://", "postgresql+asyncpg://", 1
+            ).replace(
+                "postgresql://", "postgresql+asyncpg://", 1
+            )
+        if not self.db_host or not self.db_password:
+            raise ValueError(
+                "Set DATABASE_URL/DB_URL or provide DB_HOST and DB_PASSWORD"
+            )
         return (
             f"postgresql+asyncpg://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
@@ -93,6 +108,10 @@ class Settings(BaseSettings):
         Returns:
             Sync-compatible PostgreSQL connection string.
         """
+        if not self.db_host or not self.db_password:
+            raise ValueError(
+                "Set DATABASE_URL/DB_URL or provide DB_HOST and DB_PASSWORD"
+            )
         return (
             f"postgresql://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"

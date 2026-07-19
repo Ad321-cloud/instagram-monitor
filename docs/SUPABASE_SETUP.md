@@ -16,12 +16,19 @@
 1. Go to **Project Settings** → **Database**.
 2. Under **Connection string**, select **URI** and note:
    - **Host**: `db.xxxxxxxxxxxx.supabase.co`
-   - **Port**: `5432` (default, use `6543` for connection pooling via pgBouncer)
+   - **Port**: use the **Session pooler** URI for this long-running Render service
    - **Database name**: `postgres`
    - **User**: `postgres`
    - **Password**: The password you set in Step 1
 
-3. Copy these into your `.env` file:
+3. For Render, copy the URI connection string into the `DATABASE_URL` environment
+   variable. It should look like this (replace the placeholders and URL-encode any
+   special characters in the password):
+   ```env
+   DATABASE_URL=postgresql+asyncpg://postgres.<project-ref>:your-password@aws-1-ap-south-1.pooler.supabase.com:5432/postgres?ssl=require
+   ```
+
+   For local development, you can instead copy these into your `.env` file:
    ```env
    DB_HOST=db.xxxxxxxxxxxx.supabase.co
    DB_PORT=5432
@@ -69,14 +76,15 @@ asyncio.run(test())
 
 ## Connection Pooling (Optional, Recommended for Production)
 
-For production use with multiple connections, use Supabase's built-in pgBouncer:
+For production use with multiple connections, use Supabase's built-in pooler:
 
 1. Go to **Project Settings** → **Database** → **Connection Pooling**.
-2. Enable connection pooling.
-3. Use port `6543` instead of `5432` in your `.env`:
-   ```env
-   DB_PORT=6543
-   ```
+2. Copy the **Session pooler** URI for this long-running service. It uses port
+   `5432` and avoids transaction-pooler prepared-statement limitations.
+3. If you use the transaction pooler instead, configure SQLAlchemy/asyncpg to
+   disable prepared statements before using port `6543`.
+4. Use the exact host and username shown by Supabase; do not manually guess the
+   region hostname or project reference.
 
 ## Free Tier Limits
 
