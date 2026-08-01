@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -47,10 +47,15 @@ class TestInstagramChecker:
         checker = InstagramChecker(check_delay=5.0)
         assert checker._check_delay == 5.0
 
-    def test_interpret_status_200(self) -> None:
-        """HTTP 200 should map to 'active'."""
+    def test_interpret_status_200_without_body_is_unknown(self) -> None:
+        """HTTP 200 without profile content is not enough to prove active."""
         checker = InstagramChecker()
-        assert checker._interpret_status(200) == "active"
+        assert checker._interpret_status(200) == "unknown"
+
+    def test_interpret_status_200_profile_content_is_active(self) -> None:
+        """HTTP 200 with profile metadata maps to active."""
+        checker = InstagramChecker()
+        assert checker._interpret_status(200, '<meta property="og:description">') == "active"
 
     def test_interpret_status_404(self) -> None:
         """HTTP 404 should map to 'available'."""
@@ -63,14 +68,30 @@ class TestInstagramChecker:
         assert checker._interpret_status(302) == "unknown"
 
     @pytest.mark.asyncio
-    async def test_http_200_login_page_is_not_marked_disabled(self) -> None:
-        """Instagram's generic 200 login page must not become unavailable."""
+    async def test_http_200_login_page_is_unknown(self) -> None:
+        """Instagram's generic 200 login page must not become active."""
         checker = InstagramChecker()
         checker._do_request = AsyncMock(
             return_value=(200, 120.0, "<html><title>Instagram</title></html>")
         )
         result = await checker.check_username("live_profile")
-        assert result.status == "active"
+        assert result.status == "unknown"
+        await checker.close()
+
+    @pytest.mark.asyncio
+    async def test_http_200_profile_error_page_is_unavailable(self) -> None:
+        """Instagram's explicit profile error page is unavailable."""
+        checker = InstagramChecker()
+        checker._do_request = AsyncMock(
+            return_value=(
+                200,
+                120.0,
+                '{"pageID":"httpErrorPage",'
+                '"show_lox_redesigned_404_page":true}',
+            )
+        )
+        result = await checker.check_username("missing_profile")
+        assert result.status == "unavailable"
         await checker.close()
 
     def test_interpret_status_429(self) -> None:

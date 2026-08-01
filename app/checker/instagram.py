@@ -15,6 +15,7 @@ Design Decisions:
 """
 
 import asyncio
+import json
 import random
 import re
 import time
@@ -110,6 +111,14 @@ class CheckResult:
     http_status_code: Optional[int] = None
     response_time_ms: float = 0.0
     follower_count: Optional[int] = None
+    full_name: Optional[str] = None
+    user_id: Optional[str] = None
+    is_private: Optional[bool] = None
+    account_type: Optional[str] = None
+    following_count: Optional[int] = None
+    post_count: Optional[int] = None
+    biography: Optional[str] = None
+    profile_pic_url: Optional[str] = None
     error: Optional[str] = None
     checked_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -173,7 +182,7 @@ class InstagramChecker:
             "Cache-Control": "max-age=0",
         }
 
-    def _interpret_status(self, http_status: int) -> str:
+    def _interpret_status(self, http_status: int, body: Optional[str] = None) -> str:
         """Interpret an HTTP status code into a username state.
 
         Args:
@@ -183,6 +192,22 @@ class InstagramChecker:
             One of: 'active', 'available', 'unavailable', 'unknown'.
         """
         if http_status == 200:
+            # Instagram sometimes returns HTTP 200 for its client-rendered
+            # profile error page.  Do not treat that generic shell as a live
+            # profile.  These markers are emitted for the explicit profile
+            # error page (for example, a disabled or missing profile).
+            body_lower = (body or "").lower()
+            if (
+                '"pageid":"httperrorpage"' in body_lower
+                or '"show_lox_redesigned_404_page":true' in body_lower
+            ):
+                return "unavailable"
+
+            # Login/challenge shells also commonly return 200.  They do not
+            # prove that the profile is active, so preserve the last reliable
+            # database state instead of reporting a false positive.
+            if not body or '"og:description"' not in body_lower:
+                return "unknown"
             return "active"
         elif http_status == 404:
             return "available"
@@ -224,6 +249,67 @@ class InstagramChecker:
                 pass
 
         return None
+
+    @staticmethod
+    def _json_string(html: str, *keys: str) -> Optional[str]:
+        """Extract a JSON string value embedded in Instagram's public HTML."""
+        for key in keys:
+            match = re.search(
+                rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"', html
+            )
+            if match:
+                try:
+                    return json.loads(f'"{match.group(1)}"')
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    @staticmethod
+    def _json_int(html: str, *keys: str) -> Optional[int]:
+        """Extract an integer value embedded in Instagram's public HTML."""
+        for key in keys:
+            match = re.search(rf'"{re.escape(key)}"\s*:\s*"?(\d+)"?', html)
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _json_bool(html: str, *keys: str) -> Optional[bool]:
+        """Extract a boolean value embedded in Instagram's public HTML."""
+        for key in keys:
+            match = re.search(rf'"{re.escape(key)}"\s*:\s*(true|false)', html, re.I)
+            if match:
+                return match.group(1).lower() == "true"
+        return None
+
+    @staticmethod
+    def _meta_content(html: str, property_name: str) -> Optional[str]:
+        """Get the content of an Open Graph meta element regardless of attribute order."""
+        for tag in re.findall(r"<meta\b[^>]*>", html, re.I):
+            prop = re.search(r'(?:property|name)=["\']([^"\']+)["\']', tag, re.I)
+            content = re.search(r'content=["\']([^"\']*)["\']', tag, re.I)
+            if prop and content and prop.group(1).lower() == property_name.lower():
+                return content.group(1)
+        return None
+
+    def _extract_profile_details(self, html: str) -> dict[str, object]:
+        """Extract public profile data embedded in Instagram's profile page."""
+        return {
+            "full_name": self._json_string(html, "full_name"),
+            "user_id": self._json_string(html, "pk", "id") or (
+                str(self._json_int(html, "pk", "id"))
+                if self._json_int(html, "pk", "id") is not None else None
+            ),
+            "is_private": self._json_bool(html, "is_private"),
+            "account_type": self._json_string(html, "account_type", "category_name"),
+            "following_count": self._json_int(html, "following_count"),
+            "post_count": self._json_int(html, "media_count"),
+            "biography": self._json_string(html, "biography"),
+            "profile_pic_url": (
+                self._json_string(html, "profile_pic_url_hd", "profile_pic_url")
+                or self._meta_content(html, "og:image")
+            ),
+        }
 
     @retry(
         stop=stop_after_attempt(3),
@@ -285,12 +371,14 @@ class InstagramChecker:
 
         try:
             http_status, response_time, body = await self._do_request(url)
-            status = self._interpret_status(http_status)
+            status = self._interpret_status(http_status, body)
             
             # Extract follower count for active profiles
             follower_count: Optional[int] = None
+            profile_details: dict[str, object] = {}
             if status == "active" and body:
                 follower_count = self._extract_follower_count(body)
+                profile_details = self._extract_profile_details(body)
                 if follower_count is not None:
                     logger.info(
                         "Extracted follower count for {}: {}",
@@ -318,6 +406,14 @@ class InstagramChecker:
                 http_status_code=http_status,
                 response_time_ms=response_time,
                 follower_count=follower_count,
+                full_name=profile_details.get("full_name"),
+                user_id=profile_details.get("user_id"),
+                is_private=profile_details.get("is_private"),
+                account_type=profile_details.get("account_type"),
+                following_count=profile_details.get("following_count"),
+                post_count=profile_details.get("post_count"),
+                biography=profile_details.get("biography"),
+                profile_pic_url=profile_details.get("profile_pic_url"),
             )
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:

@@ -114,7 +114,7 @@ class TestSettings:
         with patch.dict(os.environ, env):
             from app.config.settings import Settings
             s = Settings()
-            assert s.check_interval_seconds == 300
+            assert s.check_interval_seconds == 120
             assert s.check_delay_seconds == 10
             assert s.max_concurrent_checks == 3
             assert s.log_level == "INFO"

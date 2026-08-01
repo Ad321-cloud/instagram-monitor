@@ -27,6 +27,7 @@ env/
 # Logs
 logs/
 *.log
+.monitor.pid
 
 # Database (local dev)
 *.db

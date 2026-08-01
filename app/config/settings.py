@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     telegram_chat_id: str
 
     # --- Monitoring ---
-    check_interval_seconds: int = 300
+    check_interval_seconds: int = 120
     check_delay_seconds: int = 10
     max_concurrent_checks: int = 3
 

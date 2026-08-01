@@ -113,7 +113,12 @@ instagram-monitor/
 
 ## Deployment
 
-See [Deployment Guide](docs/DEPLOYMENT.md) for full Oracle Cloud + systemd setup.
+For local operation on this PC or a Mac, see [Local Deployment](docs/LOCAL_DEPLOYMENT.md).
+The bot must run on exactly one machine at a time because Telegram polling does not
+support two active bot processes using the same token. Supabase remains the shared
+database, so switching machines does not lose monitored usernames or history.
+
+For a Linux server, see [Deployment Guide](docs/DEPLOYMENT.md).
 
 ## Running Tests
 

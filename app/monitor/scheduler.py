@@ -35,7 +35,7 @@ class MonitorScheduler:
         repository: UsernameRepository,
         checker: InstagramChecker,
         notifier: TelegramBot,
-        check_interval: int = 300,
+        check_interval: int = 120,
         max_concurrent: int = 3,
     ) -> None:
         """Initialize the monitor scheduler.

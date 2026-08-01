@@ -12,11 +12,13 @@ Design Decisions:
 """
 
 from datetime import datetime, timezone
+from io import BytesIO
+from html import escape
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from loguru import logger
-from telegram import Bot, Update
+from telegram import Bot, InputFile, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -86,6 +88,44 @@ def _format_time(dt: Optional[datetime]) -> str:
         
     ist_dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
     return ist_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def _profile_card(result: "CheckResult") -> str:  # noqa: F821
+    """Build the rich Instagram-information card used for profile lookups."""
+    status = _STATUS_DISPLAY.get(result.status, result.status.upper())
+    status_icon = _STATUS_EMOJI.get(result.status, "⚪")
+    private = (
+        "PRIVATE" if result.is_private else "PUBLIC"
+        if result.is_private is not None else "N/A"
+    )
+    verified = " ✅" if result.status == "active" else ""
+    account_type = escape(result.account_type.upper()) if result.account_type else "N/A"
+    bio = escape(result.biography) if result.biography else "No bio available"
+    full_name = escape(result.full_name) if result.full_name else "N/A"
+    user_id = escape(result.user_id) if result.user_id else "N/A"
+
+    return (
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📸 <b>INSTAGRAM INFO</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>USERNAME</b>  » @{escape(result.username)}{verified}\n"
+        f"👑 <b>NAME</b>  » {full_name}\n"
+        f"🆔 <b>USER ID</b>  » <code>{user_id}</code>\n"
+        f"🔒 <b>STATUS</b>  » {status_icon} {status} ({private})\n"
+        f"📁 <b>ACCOUNT TYPE</b>  » {account_type}\n"
+        f"🔗 <b>PROFILE</b>  » <a href='https://instagram.com/{escape(result.username)}'>VIEW PROFILE</a>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>FOLLOWERS</b>  » {_format_followers(result.follower_count)}\n"
+        f"🔄 <b>FOLLOWING</b>  » {_format_followers(result.following_count)}\n"
+        f"📱 <b>POSTS</b>  » {_format_followers(result.post_count)}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💬 <b>BIO</b>\n"
+        f"{bio}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🚀 <b>RESPONSE TIME</b>  » {result.response_time_ms / 1000:.2f}s\n"
+        f"🕐 {_format_time(result.checked_at)}\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
 
 
 class TelegramBot:
@@ -267,10 +307,6 @@ class TelegramBot:
             # Immediate check
             await update.message.reply_text("🔄 Checking now...", parse_mode="HTML")
             result = await checker.check_username(username)
-            emoji = _STATUS_EMOJI.get(result.status, "⚪")
-            display = _STATUS_DISPLAY.get(result.status, result.status.upper())
-            followers = _format_followers(result.follower_count)
-
             # Update DB with first check result
             from app.models.username import UsernameStatus
             try:
@@ -286,20 +322,10 @@ class TelegramBot:
                 follower_count=result.follower_count,
             )
 
-            msg = (
-                f"{emoji} <b>@{username}</b>\n"
-                f"\n"
-                f"Status: <b>{display}</b>\n"
-                f"Followers: <b>{followers}</b>\n"
-                f"HTTP: {result.http_status_code or 'N/A'} | "
-                f"Response: {result.response_time_ms:.0f}ms\n"
-                f"\n"
-                f"🔗 <a href='https://instagram.com/{username}'>View Profile</a>\n"
-                f"🕐 {_format_time(result.checked_at)}\n"
-                f"\n"
-                f"📡 Now monitoring — you'll be notified of any changes."
+            await TelegramBot._reply_with_profile_card(update, result)
+            await update.message.reply_text(
+                "📡 Now monitoring — you’ll be notified of any changes.", parse_mode="HTML"
             )
-            await update.message.reply_text(msg, parse_mode="HTML")
 
         except Exception as e:
             logger.error("Error in /monitor for {}: {}", username, e)
@@ -389,31 +415,15 @@ class TelegramBot:
 
         try:
             result = await checker.check_username(username)
-            emoji = _STATUS_EMOJI.get(result.status, "⚪")
-            display = _STATUS_DISPLAY.get(result.status, result.status.upper())
-            followers = _format_followers(result.follower_count)
-
-            # Get stored data for disable/return times
             db_record = await repo.get_by_username(username)
-
-            msg = f"{emoji} <b>@{username}</b>\n\n"
-            msg += f"Status: <b>{display}</b>\n"
-            msg += f"Followers: <b>{followers}</b>\n"
-            msg += f"HTTP: {result.http_status_code or 'N/A'} | Response: {result.response_time_ms:.0f}ms\n"
-
-            if db_record:
-                msg += "\n"
+            await TelegramBot._reply_with_profile_card(update, result)
+            if db_record and (db_record.disabled_at or db_record.returned_at):
+                history = ""
                 if db_record.disabled_at:
-                    msg += f"🔴 Last disabled: <b>{_format_time(db_record.disabled_at)}</b>\n"
+                    history += f"🔴 Last disabled: <b>{_format_time(db_record.disabled_at)}</b>\n"
                 if db_record.returned_at:
-                    msg += f"🟢 Last returned: <b>{_format_time(db_record.returned_at)}</b>\n"
-                if db_record.last_checked_at:
-                    msg += f"🕐 Last checked: {_format_time(db_record.last_checked_at)}\n"
-
-            msg += f"\n🔗 <a href='https://instagram.com/{username}'>View Profile</a>"
-            msg += f"\n🕐 Checked: {_format_time(result.checked_at)}"
-
-            await update.message.reply_text(msg, parse_mode="HTML")
+                    history += f"🟢 Last returned: <b>{_format_time(db_record.returned_at)}</b>"
+                await update.message.reply_text(history, parse_mode="HTML")
 
         except Exception as e:
             logger.error("Error in /status for {}: {}", username, e)
@@ -529,6 +539,22 @@ class TelegramBot:
             parse_mode="HTML",
         )
 
+    @staticmethod
+    async def _reply_with_profile_card(update: Update, result: "CheckResult") -> None:  # noqa: F821
+        """Reply with the profile photo and information card when available."""
+        card = _profile_card(result)
+        if result.profile_pic_url:
+            try:
+                await update.message.reply_photo(
+                    photo=result.profile_pic_url,
+                    caption=card,
+                    parse_mode="HTML",
+                )
+                return
+            except TelegramError as e:
+                logger.warning("Could not send profile image for {}: {}", result.username, e)
+        await update.message.reply_text(card, parse_mode="HTML")
+
     # ── Notification Methods (called by the scheduler) ────────────────
 
     @retry(
@@ -554,6 +580,50 @@ class TelegramBot:
             parse_mode="HTML",
         )
         return True
+
+    async def _send_return_screenshot(self, username: str) -> bool:
+        """Capture and send a small public Instagram profile screenshot.
+
+        Screenshot capture is deliberately best-effort: Instagram may present a
+        login/challenge page, but that must never prevent the return alert itself.
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("Playwright is not installed; skipping screenshot for @{}", username)
+            return False
+
+        try:
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
+                try:
+                    page = await browser.new_page(
+                        viewport={"width": 420, "height": 620},
+                        device_scale_factor=1,
+                    )
+                    await page.goto(
+                        f"https://www.instagram.com/{username}/",
+                        wait_until="domcontentloaded",
+                        timeout=20_000,
+                    )
+                    await page.wait_for_timeout(1500)
+                    image = await page.screenshot(type="jpeg", quality=82, full_page=False)
+                finally:
+                    await browser.close()
+
+            if self._bot is None:
+                self._bot = Bot(token=self._bot_token)
+            await self._bot.send_photo(
+                chat_id=self._chat_id,
+                photo=InputFile(BytesIO(image), filename=f"{username}-returned.jpg"),
+                caption=f"📸 <b>@{escape(username)}</b> profile after returning online",
+                parse_mode="HTML",
+            )
+            logger.info("Return screenshot sent for @{}", username)
+            return True
+        except Exception as e:
+            logger.warning("Could not capture return screenshot for @{}: {}", username, e)
+            return False
 
     async def send_status_change(
         self,
@@ -624,6 +694,8 @@ class TelegramBot:
 
         try:
             await self._send_message(message)
+            if old_status == "unavailable" and new_status == "active":
+                await self._send_return_screenshot(username)
             logger.info(
                 "Status change notification sent: {} {} -> {}",
                 username, old_status, new_status,

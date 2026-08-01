@@ -94,4 +94,4 @@ Supabase free tier includes:
 - **2 active projects**
 - **50,000** monthly active users (not relevant for us)
 
-For our use case (monitoring usernames), even 100 usernames checked every 5 minutes for a year would use < 50 MB. The free tier is more than sufficient.
+For our use case (monitoring usernames), even 100 usernames checked every 2 minutes for a year would use < 50 MB. The free tier is more than sufficient.
