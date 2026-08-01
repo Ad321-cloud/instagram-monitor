@@ -607,6 +607,21 @@ class TelegramBot:
                         timeout=20_000,
                     )
                     await page.wait_for_timeout(1500)
+                    # Instagram often places a sign-up/login dialog over the
+                    # public profile. Close it so the notification contains
+                    # the profile page rather than the promotional overlay.
+                    await page.keyboard.press("Escape")
+                    for selector in (
+                        'button[aria-label="Close"]',
+                        '[role="dialog"] button[aria-label="Close"]',
+                    ):
+                        close_button = page.locator(selector).first
+                        if await close_button.count():
+                            try:
+                                await close_button.click(timeout=2_000)
+                            except Exception:
+                                pass
+                    await page.wait_for_timeout(500)
                     image = await page.screenshot(type="jpeg", quality=82, full_page=False)
                 finally:
                     await browser.close()
