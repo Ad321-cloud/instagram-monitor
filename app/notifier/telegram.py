@@ -597,10 +597,12 @@ class TelegramBot:
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=True)
                 try:
-                    page = await browser.new_page(
-                        viewport={"width": 420, "height": 620},
+                    context = await browser.new_context(
+                        viewport={"width": 760, "height": 340},
                         device_scale_factor=1,
+                        color_scheme="dark",
                     )
+                    page = await context.new_page()
                     await page.goto(
                         f"https://www.instagram.com/{username}/",
                         wait_until="domcontentloaded",
@@ -622,8 +624,10 @@ class TelegramBot:
                             except Exception:
                                 pass
                     await page.wait_for_timeout(500)
-                    image = await page.screenshot(type="jpeg", quality=82, full_page=False)
+                    image = await page.screenshot(type="jpeg", quality=88, full_page=False)
                 finally:
+                    if "context" in locals():
+                        await context.close()
                     await browser.close()
 
             if self._bot is None:
