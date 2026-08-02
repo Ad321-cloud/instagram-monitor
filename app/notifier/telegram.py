@@ -445,26 +445,45 @@ class TelegramBot:
                 )
                 return
 
-            msg = f"📋 <b>Monitored Usernames</b> ({len(usernames)})\n\n"
-
-            for u in usernames:
-                emoji = _STATUS_EMOJI.get(u.current_status, "⚪")
-                followers = _format_followers(u.follower_count)
-                last_check = (
-                    u.last_checked_at.strftime("%m/%d %H:%M")
-                    if u.last_checked_at
-                    else "Never"
-                )
-                msg += f"{emoji} <b>@{u.username}</b> — {u.current_status.upper()}"
-                msg += f" | 👥 {followers} | ⏱ {last_check}\n"
-
-                # Show disable/return info if available
+            header = (
+                "📋 <b>MONITORED ACCOUNTS</b>\n"
+                f"<b>Total:</b> {len(usernames)}\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+            )
+            blocks: list[str] = []
+            for index, u in enumerate(usernames, start=1):
+                emoji = _STATUS_EMOJI.get(u.current_status, "❔")
+                status = _STATUS_DISPLAY.get(u.current_status, u.current_status.upper())
+                history = ""
                 if u.disabled_at:
-                    msg += f"   🔴 Disabled: {_format_time(u.disabled_at)}\n"
+                    history += f"\n   ⛔ Disabled: {_format_time(u.disabled_at)}"
                 if u.returned_at:
-                    msg += f"   🟢 Returned: {_format_time(u.returned_at)}\n"
+                    history += f"\n   🏆 Returned: {_format_time(u.returned_at)}"
+                blocks.append(
+                    f"<b>{index}. {emoji} @{escape(u.username)}</b>\n"
+                    f"   Status: <code>{status}</code>\n"
+                    f"   👥 Followers: <b>{_format_followers(u.follower_count)}</b>\n"
+                    f"   🕐 Last check: {_format_time(u.last_checked_at)}"
+                    f"{history}\n"
+                    f"   🔗 <a href='https://instagram.com/{escape(u.username)}'>View profile</a>"
+                )
 
-            await update.message.reply_text(msg, parse_mode="HTML")
+            # Telegram limits messages to 4096 characters; preserve each card
+            # and send multiple clean pages when many accounts are monitored.
+            pages: list[str] = []
+            current = header
+            for block in blocks:
+                candidate = f"{current}\n{block}\n━━━━━━━━━━━━━━━━━━\n"
+                if len(candidate) > 3900 and current != header:
+                    pages.append(current.rstrip())
+                    current = header + block + "\n━━━━━━━━━━━━━━━━━━\n"
+                else:
+                    current = candidate
+            if current.strip() != header.strip():
+                pages.append(current.rstrip())
+
+            for page in pages:
+                await update.message.reply_text(page, parse_mode="HTML")
 
         except Exception as e:
             logger.error("Error in /list: {}", e)
