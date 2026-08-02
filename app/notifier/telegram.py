@@ -468,22 +468,14 @@ class TelegramBot:
                     f"   🔗 <a href='https://instagram.com/{escape(u.username)}'>View profile</a>"
                 )
 
-            # Telegram limits messages to 4096 characters; preserve each card
-            # and send multiple clean pages when many accounts are monitored.
-            pages: list[str] = []
-            current = header
+            # Send one account per Telegram message so every monitored profile
+            # is easy to scan and no long list becomes visually crowded.
+            await update.message.reply_text(header.rstrip(), parse_mode="HTML")
             for block in blocks:
-                candidate = f"{current}\n{block}\n━━━━━━━━━━━━━━━━━━\n"
-                if len(candidate) > 3900 and current != header:
-                    pages.append(current.rstrip())
-                    current = header + block + "\n━━━━━━━━━━━━━━━━━━\n"
-                else:
-                    current = candidate
-            if current.strip() != header.strip():
-                pages.append(current.rstrip())
-
-            for page in pages:
-                await update.message.reply_text(page, parse_mode="HTML")
+                await update.message.reply_text(
+                    f"{block}\n━━━━━━━━━━━━━━━━━━",
+                    parse_mode="HTML",
+                )
 
         except Exception as e:
             logger.error("Error in /list: {}", e)
