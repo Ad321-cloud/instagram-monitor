@@ -592,7 +592,7 @@ class TelegramBot:
         )
         return True
 
-    async def _send_return_screenshot(self, username: str) -> bool:
+    async def _send_return_screenshot(self, username: str, caption: str) -> bool:
         """Capture and send a small public Instagram profile screenshot.
 
         Screenshot capture is deliberately best-effort: Instagram may present a
@@ -646,7 +646,7 @@ class TelegramBot:
             await self._bot.send_photo(
                 chat_id=self._chat_id,
                 photo=InputFile(BytesIO(image), filename=f"{username}-returned.jpg"),
-                caption=f"📸 <b>@{escape(username)}</b> profile after returning online",
+                caption=caption,
                 parse_mode="HTML",
             )
             logger.info("Return screenshot sent for @{}", username)
@@ -723,9 +723,14 @@ class TelegramBot:
         )
 
         try:
-            await self._send_message(message)
             if old_status == "unavailable" and new_status == "active":
-                await self._send_return_screenshot(username)
+                # Keep the recovery image and its complete alert together as
+                # one Telegram photo message with the alert as its caption.
+                screenshot_sent = await self._send_return_screenshot(username, message)
+                if not screenshot_sent:
+                    await self._send_message(message)
+            else:
+                await self._send_message(message)
             logger.info(
                 "Status change notification sent: {} {} -> {}",
                 username, old_status, new_status,
