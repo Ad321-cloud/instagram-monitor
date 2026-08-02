@@ -39,10 +39,10 @@ from app.models.username import UsernameStatus
 
 # Emoji indicators for each status
 _STATUS_EMOJI: dict[str, str] = {
-    "active": "🟢",
-    "available": "🔵",
-    "unavailable": "🔴",
-    "unknown": "⚪",
+    "active": "✅",
+    "available": "✨",
+    "unavailable": "⛔",
+    "unknown": "❔",
 }
 
 _STATUS_DISPLAY: dict[str, str] = {
@@ -677,22 +677,22 @@ class TelegramBot:
 
         # Determine headline and details based on transition
         if new_status == "unavailable":
-            headline = "🔴 Profile Disabled!"
+            headline = "⛔ Profile Restricted"
             detail = f"<b>@{username}</b> has been <b>DISABLED</b>"
             if disabled_at:
                 detail += f"\n⏰ Disabled at: <b>{_format_time(disabled_at)}</b>"
         elif old_status == "unavailable" and new_status == "active":
-            headline = "🟢 Profile Returned!"
-            detail = f"<b>@{username}</b> is <b>BACK ONLINE</b>"
+            headline = "🏆✅ Account Recovered!"
+            detail = f"<b>@{username}</b> is <b>BACK ONLINE</b> again"
             if returned_at:
                 detail += f"\n⏰ Returned at: <b>{_format_time(returned_at)}</b>"
             if disabled_at:
                 detail += f"\n🔴 Was disabled since: {_format_time(disabled_at)}"
         elif new_status == "available":
-            headline = "🔵 Username Available!"
+            headline = "✨ Username Available!"
             detail = f"<b>@{username}</b> is now <b>AVAILABLE</b>"
         elif new_status == "active":
-            headline = "🟢 Username Active"
+            headline = "✅ Username Active"
             detail = f"<b>@{username}</b> is now <b>ACTIVE</b>"
         else:
             headline = "⚪ Status Changed"
